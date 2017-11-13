@@ -1,0 +1,624 @@
+---
+title: "Sim 1 - Whack a Node"
+author:
+- Michael Hallquist
+- Frank Hillary
+date: "9/11/2017"
+output:
+  html_document:
+    code_folding: hide
+    df_print: kable
+    mathjax: default
+    number_sections: yes
+    theme: spacelab
+    toc: yes
+  html_notebook: null
+---
+
+```{r setup, include=FALSE}
+#setwd(file.path(getMainDir(), "clinical_brainnetwork_sim")) #should be where this script lives already
+source("simulate_clingraph.R")
+suppressMessages(library(tidyverse))
+suppressMessages(library(igraph))
+suppressMessages(library(knitr))
+suppressMessages(library(broom))
+suppressMessages(library(parallel))
+knitr::opts_chunk$set(echo = TRUE)
+options(dplyr.show_progress=FALSE) #do not output massive progress bar garbage to html
+```
+
+#Premise of proportional thresholding
+
+Proportional thresholding is commonly applied to binary graphs, typically with the argument that it helps to rule out the possibility that group differences in nodal statistics are not attributable to density. That is, if one group has a denser network structure than another at a given edge definition threshold (e.g., *r* = 0.3), then one might find significant differences in nodal statistics that reflect global structure, not nodal structure.
+
+#Does proportional thresholding rule out density differences?
+
+Let's test this idea by simulating two groups, one with systematically stronger connectivity than the other (*r* + .2), but no other substantive changes in the graph details.
+
+```{r simglobal, cache=TRUE}
+#updated thinking about whack: need some nodal stats that are in the opposite direction, but would be marginal
+#if a pure r thresholding perspective were applied. But then with density, it will tend to push those opposite effects toward significance
+global_increase <- simulate_clingraph(
+  g_positive, npergroup=50, edgenoise=list(sd=0.05, dist="gaussian"),
+  groupmanipulation=list(
+    controls=list(
+      group_name="controls", 
+      edgeshift_weight_bw_mean=0, edgeshift_weight_wi_sd=0.1, edgeshift_weight_bw_sd=0.2 #add variability to global shifts in weights (needed for b/w subs variability)
+    ),
+    patients=list(
+      group_name="patients", 
+      edgeshift_weight_bw_mean=0.2, edgeshift_weight_wi_sd=0.1, edgeshift_weight_bw_sd=0.2 #global mean shifts in weights, but identical b/w variability
+    )
+  )
+)
+```
+
+##Density thresholding
+
+Densities between 5% and 25%.
+
+First, sanity check one graph at 5% to ensure that that `target_density` attribute matches the observed density.
+
+```{r dthresh, cache=FALSE}
+#density threshold both groups
+densities_desired <- seq(.05, .25, .01)
+allg_density <- threshold_glist(global_increase, densities_desired, method="density")
+
+#sanity checks
+x <- allg_density[["density_0.05"]][["patients"]][[2]]
+graph.density(x)
+x$target_density
+```
+
+Now examine the distribution of correlations in this sample graph:
+```{r}
+lattice::histogram(E(x)$w_hidden)
+summary(E(x)$w_hidden)
+```
+
+Now compute *t*-tests at each density to ensure that the *r* threshold is consistently higher in 'patients', who were simulated with hyperconnectivity (higher correlations).
+```{r}
+threshold_weights <- lapply(allg_density, function(dlist) {
+  lapply(dlist, function(group) { 
+    sapply(group, function(g) { g$wthresh })
+  })
+})
+
+allstats <- bind_rows(lapply(threshold_weights, function(d) {
+  tidy(t.test(d$controls, d$patients))
+})) %>% 
+  rename(meandiff=estimate, mcontrol=estimate1, mpatient=estimate2, tstat=statistic) %>%
+  mutate(density=names(allg_density)) %>%
+  select(density, mcontrol, mpatient, meandiff, tstat, p.value)
+
+kable(allstats)
+```
+
+Conclusion: We have achieved a consistent difference in mean connectivity strength between groups such that the connectivity threshold is systematically higher in patients to achieve the same density in both groups.
+
+##Are there differences in nodal statistics?
+
+If density thresholding has succeeded, we should see essentially no group differences in nodal statistics because we only simulated global, not nodal, shifts in connectivity. Thus, if the premise of proportional thresholding is correct, this simulation should validate the use of this approach for ruling out density-related explanations.
+
+Plot *t*-statistics for group comparisons at every density.
+```{r densdegree, cache=TRUE}
+nodal <- nodal_measures_glist(allg_density)
+nodal_summaries <- summarize_nodal_measures(nodal)
+nodal_combined <- bind_nodal_measures(nodal)
+#xtabs(~thresh + group + nodeNum, nodal_combined) #verify frequencies in combined dataset
+
+toprint <- arrange(nodal_summaries, thresh, node, group) %>% select(thresh, node, group, degree_mean, degree_sd) %>% head(n=15)
+kable(toprint)
+
+degree_effects <- nodal_combined %>% group_by(thresh, nodeNum) %>%
+  do({
+    mm <- lm(degree ~ group, .)
+    partab <- tidy(mm)
+    pfilt <- filter(partab, term=="grouppatients")
+    pfilt
+  }) %>% ungroup()
+
+#critical t-test value at n=100 (~96 df on average)
+critval <- qt(.025, 96)
+
+#filter out 5% to make the graph prettier (fits on 4 rows)
+ggplot(filter(degree_effects, thresh!="density_0.05")) +
+  aes(x=nodeNum, y=statistic) + 
+  geom_bar(stat="identity") + 
+  geom_hline(yintercept=c(-critval,critval)) + 
+  facet_wrap(~thresh) + ggtitle("Nodal differences by group in global strength simulation (dens. threshold)")
+```
+
+We would expect 5% of them to be significant by chance due to Type I error.
+
+```{r}
+  sum(degree_effects$p.value < .05)/nrow(degree_effects)
+```
+
+So, we are in the range of the nominal .05 error rate, suggesting that proportional thresholding eliminates group differences in degree that are attributable to global differences in connectivity strength.
+
+##Strength thresholding
+
+But what happens when we set a specific strength-based threshold that is enforced equally across groups? Will patients have greater centrality than controls in general?
+
+Use *r*s in the range of .2 - .5 since that is close to where the density thresholds fell... rather than evenly spacing, we should probably look at edges retained by r to linearize this... okay for now.
+
+```{r}
+#strength threshold both groups
+#placed in separate chunk to avoid caching below (since allg_bystrength is a huge object)
+rs_desired <- seq(.2, .5, .02)
+allg_bystrength <- threshold_glist(global_increase, rs_desired, method="strength")
+```
+
+```{r diffbystrength, cache=TRUE}
+nodal_bystrength <- nodal_measures_glist(allg_bystrength)
+nodal_summaries_bystrength <- summarize_nodal_measures(nodal_bystrength)
+nodal_combined_bystrength <- bind_nodal_measures(nodal_bystrength)
+#xtabs(~thresh + group + nodeNum, nodal_combined) #verify frequencies in combined dataset
+
+degree_effects_bystrength <- nodal_combined_bystrength %>% group_by(thresh, nodeNum) %>%
+  do({
+    mm <- lm(degree ~ group, .)
+    partab <- tidy(mm)
+    pfilt <- filter(partab, term=="grouppatients")
+    pfilt
+  }) %>% ungroup()
+
+#critical t-test value at n=100 (~96 df on average)
+critval <- qt(.025, 96)
+
+#filter out 5% to make the graph prettier (fits on 4 rows)
+ggplot(filter(degree_effects_bystrength, thresh!="density_0.05")) +
+  aes(x=nodeNum, y=statistic) + 
+  geom_bar(stat="identity") + 
+  geom_hline(yintercept=c(-critval,critval)) + 
+  facet_wrap(~thresh) + ggtitle("Nodal differences by group in global strength simulation (fixed r threshold)")
+```
+
+Here, all nodes are significantly different between groups, consistent with the problem of global shifts in strength leading to spurious group differences.
+
+```{r}
+  sum(degree_effects_bystrength$p.value < .05)/nrow(degree_effects_bystrength)
+```
+
+Thus, we have provided a proof of concept for a scenario in which global connectivity differences induce widespread group differences in nodal statistics.
+
+However, what if we take the *r*-thresholded graphs and include observed density as a covariate in the models?
+
+```{r denscov, cache=TRUE}
+degree_effects_bystrength_dcov <- nodal_combined_bystrength %>% group_by(thresh, nodeNum) %>%
+  do({
+    mm <- lm(degree ~ group + density, .)
+    partab <- tidy(mm)
+    pfilt <- filter(partab, term=="grouppatients")
+    pfilt
+  }) %>% ungroup()
+
+#critical t-test value at n=100 (~96 df on average)
+critval <- qt(.025, 96)
+
+#filter out 5% to make the graph prettier (fits on 4 rows)
+ggplot(filter(degree_effects_bystrength_dcov, thresh!="density_0.05")) +
+  aes(x=nodeNum, y=statistic) + 
+  geom_bar(stat="identity") + 
+  geom_hline(yintercept=c(-critval,critval)) + 
+  facet_wrap(~thresh) + ggtitle("Nodal differences by group in global strength sim (fixed r threshold, adj. by dens)")
+```
+
+We have restored the nominal type I error rate.
+```{r}
+  sum(degree_effects_bystrength_dcov$p.value < .05)/nrow(degree_effects_bystrength_dcov)
+```
+
+#Whack a node
+
+The idea that there would be global connectivity differences between groups is implausible for most clinical studies (might MS be an exception? not sure of lesion distribution). The pathophysiology of brain disorders is likely to affect specific nodes or modules (networks). Under such a scenario, how might proportional thresholding affect conclusions about group differences? From a conceptual standpoint, for a given graph order (i.e., fixed $k$ nodes), proportional thresholding sets a limit on the number of edges, thereby having a consistent effect on degree. 
+
+$$
+D = \frac{2E}{N(N-1)}, \enspace \implies E = D \times N(N-1)
+$$
+
+Furthermore, the average degree is related to the density of the graph:
+
+$$
+D = \frac{2E}{N(N-1)}, \enspace \langle k \rangle = \frac{2E}{N} , \enspace \implies \langle k \rangle = D(N-1)
+$$
+
+Thus, proportional thresholding has a direct effect on the degree distribution of the graph. In the plausible case of group differences in the strength of some nodes, how would this play out?
+
+Our broad conception is that proportional thresholding will tend to be sensitive to simulated nodal differences between groups, but that smaller changes in the opposite direction will be spuriously magnified by this procedure.
+
+## Setup of nodal shift simulation
+
+- Simulate *N*=50 in two groups
+- Add Gaussian noise to edges for each subject, *M*=0, *SD*=.05
+- Add between-subject variability in overall strength: *M*=0, nodes w/i subject shift *SD* = 0.1, b/w subject shift *SD* = 0.2
+- Increase connectivity strength of dorsal ACC (node 215), L IFG (node 208), and R IFG (node 209): *M*=0.14, w/i *SD* = .04, b/w *SD* = .04
+- Decrease connectivity slightly in R Postcentral (node 19), R STG (node 63), and L Precuneus (node 77): *M*=-.02, w/i *SD* = .02, b/w *SD* = .02
+
+Thus decreases are 1/7th the size of increases
+
+```{r}
+whack_increase <- .14
+whack_decrease <- -.02
+poswhack <- c(208, 209, 215)
+negwhack <- c(19, 63, 77)
+
+whack <- simulate_clingraph(
+  g_positive, npergroup=50, edgenoise=list(sd=0.05, dist="gaussian"),
+  groupmanipulation=list(
+    controls=list(
+      group_name="controls",
+      edgeshift_weight_bw_mean=0, 
+      edgeshift_weight_wi_sd=0.1, 
+      edgeshift_weight_bw_sd=0.2 #global shifts in weights (needed to get reasonable b/w subs variability)
+    ),
+    patients=list(
+      group_name="patients",
+      edgeshift_weight_bw_mean=0.0,
+      edgeshift_weight_wi_sd=0.1,
+      edgeshift_weight_bw_sd=0.2, #global shifts in weights
+      nodemanipulation=list( #nodal shifts in (weighted) edges incident to a node
+        list(name="V215", edgeshift_weight_bw_mean=whack_increase,  #D ACC
+             edgeshift_weight_wi_sd=.04, 
+             edgeshift_weight_bw_sd=.04),
+        list(name="V208", #L IFG
+             edgeshift_weight_bw_mean=whack_increase, 
+             edgeshift_weight_wi_sd=.04, 
+             edgeshift_weight_bw_sd=.04),
+        list(name="V209", #R IFG
+             edgeshift_weight_bw_mean=whack_increase,
+             edgeshift_weight_wi_sd=.04, 
+             edgeshift_weight_bw_sd=.04),
+        list(name="V19", #R Postcentral
+             edgeshift_weight_bw_mean=whack_decrease, 
+             edgeshift_weight_wi_sd=.02, 
+             edgeshift_weight_bw_sd=.02),
+        list(name="V63", #R STG
+             edgeshift_weight_bw_mean=whack_decrease, 
+             edgeshift_weight_wi_sd=.02, 
+             edgeshift_weight_bw_sd=.02),
+        list(name="V77", #L Precuneus
+             edgeshift_weight_bw_mean=whack_decrease,
+             edgeshift_weight_wi_sd=.02, 
+             edgeshift_weight_bw_sd=.02)
+      )
+    )
+  )
+)
+
+```
+
+## Recap of van den Heuvel
+
+Proportional thresholding will tend to lead to the inclusion of more spurious connections in individuals with lower overall functional connectivity (FC) strength. By enforcing the same number of edges, weaker correlations will be preserved in low-FC subjects and these edges are unreliable (correlations of time series of a given length). They demonstrate this in part by looking at the consistency of the top 100 and bottom 100 connections across subjects, with the top 100 being represented consistently in most subjects (high b/w subjects consistency), whereas the bottom 100 are very heterogeneous (i.e., unreliable).
+
+## Predictions
+
+- Increasing the mean edge strength in a handful of nodes will increase degree in those nodes, but lead to a diffuse removal of weaker edges that were on the cusp (bottom end) of the threshold. By definition, to maintain a constant $\langle k \rangle$, the sum of positive shifts in degree for increased nodes will equal the sum of negative shifts in all other nodes. This will hold true for binary graphs.
+
+- If there are marginal, non-significant *decreases* in some nodes in the *increased* group, these will become significant under proportional thresholding because these weaker edges will tend to be deleted by proportional thresholding.
+
+- If there is a global shift in connectivity, but also some nodes that are selectively different, both proportional and fixed-strength thresholding will work.
+
+## Test 1: diffuse removal of edges
+
+### Subtest 1: equal increases and decreases in degree under global connectivity
+
+The increases in degree for the patient group under global connectivity will equal the decreases to maintain proportional thresholding.
+
+```{r}
+degree_effects %>% mutate(degchange=ifelse(estimate < 0, "negative", "positive")) %>%
+  group_by(thresh, degchange) %>% summarize(sum(estimate))
+
+#sum(filter(degree_effects, estimate < 0)$estimate) 
+#sum(filter(degree_effects, estimate > 0)$estimate)
+```
+
+So, at each density, the sum of higher degree values in patients (hyperconnected) plus lower degree values equals zero.
+
+This is not true under strength-based thresholding, where all shifts were positive by definition:
+```{r}
+degree_effects_bystrength %>% mutate(degchange=ifelse(estimate < 0, "negative", "positive")) %>%
+  group_by(thresh, degchange) %>% summarize(sum(estimate))
+```
+
+The equality of positive/negative shifts are restored when density is included as a covariate in the analysis of a strength-thresholded graph.
+```{r}
+degree_effects_bystrength_dcov %>% mutate(degchange=ifelse(estimate < 0, "negative", "positive")) %>%
+  group_by(thresh, degchange) %>% summarize(sum(estimate))
+```
+
+Note that under proportional thresholding on the global shift data, the positive and negative changes don't appear to isolate to specific nodes at first glance:
+
+```{r}
+ggplot(filter(degree_effects, thresh!="density_0.05")) + aes(x=nodeNum, y=estimate, ymin=estimate-std.error, ymax=estimate+std.error) + geom_pointrange(size=0.1) + facet_wrap(~thresh)
+```
+
+### Subtest 2: Equal and opposing changes in degree under selective nodal shifts in connectivity
+
+The same logic about average degree should hold for selective nodal shifts.
+
+```{r}
+allg_selective_bydensity <- threshold_glist(whack, densities_desired, method="density")
+
+nodal_selective_bydensity <- nodal_measures_glist(allg_selective_bydensity)
+nodal_selective_summaries_bydensity <- summarize_nodal_measures(nodal_selective_bydensity)
+nodal_selective_combined_bydensity <- bind_nodal_measures(nodal_selective_bydensity)
+#xtabs(~thresh + group + nodeNum, nodal_combined) #verify frequencies in combined dataset
+```
+
+## Test 2: induction of 'significant' negative degree changes when some nodes are increased
+
+```{r dens_selective, cache=TRUE}
+comparator_nodes <- sample(78:207, 10) #consistent random 10 nodes not targeted
+
+degree_effects_selective_bydensity <- group_lm(nodal_selective_combined_bydensity) %>% 
+  flag_nodes(pos=poswhack, neg=negwhack)
+
+#critical t-test value at n=100 (~96 df on average)
+critval <- qt(.025, 96)
+
+#look at target nodes and a random set of unselected
+#filter out 5% to make the graph prettier (fits on 4 rows)
+deg_subset <- filter(degree_effects_selective_bydensity,
+                     nodeNum %in% c(poswhack, negwhack, comparator_nodes) & thresh != "density_0.05")
+
+ggplot(deg_subset) +
+  aes(x=factor(nodeNum), y=statistic, fill=nodeType) + 
+  geom_bar(stat="identity") + 
+  geom_hline(yintercept=c(-critval,critval)) + 
+  facet_wrap(~thresh) + ggtitle("Degree differences by group in selective simulation (density threshold)") +
+  scale_x_discrete("Node", labels=NULL)
+
+```
+
+This plot makes evident that the negative targets are significantly different between groups despite representing a small change in strength. 
+
+###Would the same thing happen under strength thresholding?
+
+```{r}
+#strength threshold both groups
+#placed in separate chunk to avoid caching below (since allg_selective_bystrength is a huge object)
+allg_selective_bystrength <- threshold_glist(whack, rs_desired, method="strength")
+```
+
+```{r diffbystrength_selective, cache=TRUE}
+nodal_selective_bystrength <- nodal_measures_glist(allg_selective_bystrength)
+nodal_selective_summaries_bystrength <- summarize_nodal_measures(nodal_selective_bystrength)
+nodal_selective_combined_bystrength <- bind_nodal_measures(nodal_selective_bystrength)
+#xtabs(~thresh + group + nodeNum, nodal_selective_combined) #verify frequencies in combined dataset
+
+degree_effects_selective_bystrength <- group_lm(nodal_selective_combined_bystrength) %>%
+  flag_nodes(pos=poswhack, neg=negwhack)
+
+deg_subset <- filter(degree_effects_selective_bystrength,
+                     nodeNum %in% c(poswhack, negwhack, comparator_nodes))
+
+ggplot(deg_subset) +
+  aes(x=factor(nodeNum), y=statistic, fill=nodeType) + 
+  geom_bar(stat="identity") + 
+  geom_hline(yintercept=c(-critval,critval)) + 
+  facet_wrap(~thresh) + ggtitle("Degree differences by group in selective simulation (fixed r threshold)") +
+  scale_x_discrete("Node", labels=NULL)
+
+```
+
+So, in general, strength-based thresholding does not induce significant negative statistics, while preserving the increased nodes. TODO: look into why t-stats for positive targets are higher under proportional thresholding.
+
+###What about controlling for density in *r*-thresholded nodal statistics?
+
+```{r}
+degree_effects_selective_bystrength_dcov <- group_lm(nodal_selective_combined_bystrength, 
+                                                     f=formula(degree ~ group + density)) %>%
+  flag_nodes(pos=poswhack, neg=negwhack)
+
+deg_subset <- filter(degree_effects_selective_bystrength_dcov,
+                     nodeNum %in% c(poswhack, negwhack, comparator_nodes))
+
+ggplot(deg_subset) +
+  aes(x=factor(nodeNum), y=statistic, fill=nodeType) + 
+  geom_bar(stat="identity") + 
+  geom_hline(yintercept=c(-critval,critval)) + 
+  facet_wrap(~thresh) + ggtitle("Degree differences by group in selective simulation (fixed r threshold)") +
+  scale_x_discrete("Node", labels=NULL)
+
+```
+
+Thus, although perhaps imperfect, strength thresholding with per-subject density included as a covariate tends to result in less of the spurious negative effects.
+
+### What about weighted analysis?
+
+Perhaps all of this silliness can be avoided by maintaining edge weights and focusing on *strength* instead of *degree*.
+
+```{r}
+#zero negative edges, but otherwise leave things alone
+weighted_whack <- threshold_glist(whack, thresholds =  0, method="weight", rmweights=FALSE)
+
+nodal_selective_weighted <- nodal_measures_glist(weighted_whack)
+#nodal_selective_summaries_bydensity <- summarize_nodal_measures(nodal_selective_bydensity)
+nodal_selective_combined_weighted <- bind_nodal_measures(nodal_selective_weighted)
+
+weighted_analysis <- group_lm(nodal_selective_combined_weighted) %>%
+  flag_nodes(pos=poswhack, neg=negwhack)
+
+deg_subset <- filter(weighted_analysis, nodeNum %in% c(poswhack, negwhack, comparator_nodes))
+
+ggplot(deg_subset) +
+  aes(x=factor(nodeNum), y=statistic, fill=nodeType) + 
+  geom_bar(stat="identity") + 
+  geom_hline(yintercept=c(-critval,critval)) + 
+  facet_wrap(~thresh) + ggtitle("Degree differences by group in selective simulation (weighted)") +
+  scale_x_discrete("Node", labels=NULL)
+```
+
+```{r}
+weighted_analysis <- group_lm(nodal_selective_combined_weighted, f=formula(strength ~ group)) %>%
+  flag_nodes(pos=poswhack, neg=negwhack)
+
+strength_subset <- filter(weighted_analysis, nodeNum %in% c(poswhack, negwhack, comparator_nodes))
+
+ggplot(strength_subset) +
+  aes(x=factor(nodeNum), y=statistic, fill=nodeType) + 
+  geom_bar(stat="identity") + 
+  geom_hline(yintercept=c(-critval,critval)) + 
+  facet_wrap(~thresh) + ggtitle("Strength differences by group in selective simulation (weighted)") +
+  scale_x_discrete("Node", labels=NULL)
+
+```
+
+As expected, a weighted analysis of strength does not appear to induce negative nodal differences.
+
+## Test 3: global and selective differences
+
+```{r}
+#simulation with both global and specific differences in patient group
+whack_global_nodal <- simulate_clingraph(
+  g_positive, npergroup=50, edgenoise=list(sd=0.05, dist="gaussian"),
+  groupmanipulation=list(
+    controls=list(
+      group_name="controls",
+      edgeshift_weight_bw_mean=0, 
+      edgeshift_weight_wi_sd=0.1, 
+      edgeshift_weight_bw_sd=0.2 #between-person global variation in weights (needed to get reasonable b/w subs variability)
+    ),
+    patients=list(
+      group_name="patients",
+      edgeshift_weight_bw_mean=0.2, #0.2 shift in patient group globally
+      edgeshift_weight_wi_sd=0.1,
+      edgeshift_weight_bw_sd=0.2, #global shifts in weights
+      nodemanipulation=list( #nodal shifts in (weighted) edges incident to a node
+        list(name="V215", edgeshift_weight_bw_mean=whack_increase,  #D ACC
+             edgeshift_weight_wi_sd=.04, 
+             edgeshift_weight_bw_sd=.04),
+        list(name="V208", #L IFG
+             edgeshift_weight_bw_mean=whack_increase, 
+             edgeshift_weight_wi_sd=.04, 
+             edgeshift_weight_bw_sd=.04),
+        list(name="V209", #R IFG
+             edgeshift_weight_bw_mean=whack_increase,
+             edgeshift_weight_wi_sd=.04, 
+             edgeshift_weight_bw_sd=.04),
+        list(name="V19", #R Postcentral
+             edgeshift_weight_bw_mean=whack_decrease, 
+             edgeshift_weight_wi_sd=.02, 
+             edgeshift_weight_bw_sd=.02),
+        list(name="V63", #R STG
+             edgeshift_weight_bw_mean=whack_decrease, 
+             edgeshift_weight_wi_sd=.02, 
+             edgeshift_weight_bw_sd=.02),
+        list(name="V77", #L Precuneus
+             edgeshift_weight_bw_mean=whack_decrease,
+             edgeshift_weight_wi_sd=.02, 
+             edgeshift_weight_bw_sd=.02)
+      )
+    )
+  )
+)
+```
+
+```{r}
+allg_both_bydensity <- threshold_glist(whack_global_nodal, densities_desired, method="density")
+
+nodal_both_bydensity <- nodal_measures_glist(allg_both_bydensity)
+nodal_both_summaries_bydensity <- summarize_nodal_measures(nodal_both_bydensity)
+nodal_both_combined_bydensity <- bind_nodal_measures(nodal_both_bydensity)
+
+degree_effects_both_bystrength <- group_lm(nodal_both_combined_bydensity) %>%
+  flag_nodes(pos=poswhack, neg=negwhack)
+
+deg_subset <- filter(degree_effects_both_bystrength,
+                     nodeNum %in% c(poswhack, negwhack, comparator_nodes))
+
+ggplot(deg_subset) +
+  aes(x=factor(nodeNum), y=statistic, fill=nodeType) + 
+  geom_bar(stat="identity") + 
+  geom_hline(yintercept=c(-critval,critval)) + 
+  facet_wrap(~thresh) + ggtitle("Degree differences by group in glob + selective sim. (dens. threshold)") +
+  scale_x_discrete("Node", labels=NULL)
+
+```
+
+Same qualitative pattern as previous findings. Proportional thresholding maintains sensitivity to nodal differences even in the presence of global shifts in the patient group.
+
+
+```{r}
+allg_both_bystrength <- threshold_glist(whack_global_nodal, rs_desired, method="strength")
+
+nodal_both_bystrength <- nodal_measures_glist(allg_both_bystrength)
+nodal_both_summaries_bystrength <- summarize_nodal_measures(nodal_both_bystrength)
+nodal_both_combined_bystrength <- bind_nodal_measures(nodal_both_bystrength)
+
+degree_effects_both_bystrength <- group_lm(nodal_both_combined_bystrength) %>%
+  flag_nodes(pos=poswhack, neg=negwhack)
+
+deg_subset <- filter(degree_effects_both_bystrength,
+                     nodeNum %in% c(poswhack, negwhack, comparator_nodes))
+
+ggplot(deg_subset) +
+  aes(x=factor(nodeNum), y=statistic, fill=nodeType) + 
+  geom_bar(stat="identity") + 
+  geom_hline(yintercept=c(-critval,critval)) + 
+  facet_wrap(~thresh) + ggtitle("Degree differences by group in glob + selective sim. (strength threshold)") +
+  scale_x_discrete("Node", labels=NULL)
+
+```
+
+As one might expect, the nodes that have been selectively enhanced have especially high t-statistics. But the problem with global connectivity 'significance' inheres in the use of an equal-strength thresholding. What if we return to the inclusion of density as a covariate?
+
+```{r}
+degree_effects_both_bystrength_dcov <- group_lm(nodal_both_combined_bystrength, 
+                                                     f=formula(degree ~ group + density)) %>%
+  flag_nodes(pos=poswhack, neg=negwhack)
+
+deg_subset <- filter(degree_effects_both_bystrength_dcov,
+                     nodeNum %in% c(poswhack, negwhack, comparator_nodes))
+
+ggplot(deg_subset) +
+  aes(x=factor(nodeNum), y=statistic, fill=nodeType) + 
+  geom_bar(stat="identity") + 
+  geom_hline(yintercept=c(-critval,critval)) + 
+  facet_wrap(~thresh) + ggtitle("Degree differences by group in glob + selective simulation (fixed r threshold)") +
+  scale_x_discrete("Node", labels=NULL)
+```
+
+This puts us largely back in 'good' territory in terms of not creating spurious negative effects.
+
+Likewise, if we adopt a weighted analysis, we see 'significance' everywhere.
+```{r}
+#zero negative edges, but otherwise leave things alone
+weighted_whack_both <- threshold_glist(whack_global_nodal, thresholds=0, method="weight", rmweights=FALSE)
+
+nodal_selective_weighted <- nodal_measures_glist(weighted_whack_both)
+#nodal_selective_summaries_bydensity <- summarize_nodal_measures(nodal_selective_bydensity)
+nodal_selective_combined_weighted <- bind_nodal_measures(nodal_selective_weighted)
+
+weighted_analysis <- group_lm(nodal_selective_combined_weighted, f=formula(strength ~ group)) %>%
+  flag_nodes(pos=poswhack, neg=negwhack)
+
+deg_subset <- filter(weighted_analysis, nodeNum %in% c(poswhack, negwhack, comparator_nodes))
+
+ggplot(deg_subset) +
+  aes(x=factor(nodeNum), y=statistic, fill=nodeType) + 
+  geom_bar(stat="identity") + 
+  geom_hline(yintercept=c(-critval,critval)) + 
+  facet_wrap(~thresh) + ggtitle("Strength differences by group in glob + selective sim. (weighted)") +
+  scale_x_discrete("Node", labels=NULL)
+```
+
+How would weighted analysis with mean FC as a covariate work for us?
+
+```{r}
+
+weighted_analysis <- group_lm(nodal_selective_combined_weighted, f=formula(strength ~ group + meanFC)) %>%
+  flag_nodes(pos=poswhack, neg=negwhack)
+
+deg_subset <- filter(weighted_analysis, nodeNum %in% c(poswhack, negwhack, comparator_nodes))
+
+ggplot(deg_subset) +
+  aes(x=factor(nodeNum), y=statistic, fill=nodeType) + 
+  geom_bar(stat="identity") + 
+  geom_hline(yintercept=c(-critval,critval)) + 
+  facet_wrap(~thresh) + ggtitle("Strength differences by group in glob + selective sim. (weighted meanFC)") +
+  scale_x_discrete("Node", labels=NULL)
+```
