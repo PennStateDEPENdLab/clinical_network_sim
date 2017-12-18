@@ -111,6 +111,18 @@ for (s in 1:1) {
   #same approach for strength
   allg_bystrength <- threshold_glist(whack, rs_desired, method="strength", ncores=1)
   
+  #just a quick bit of code to help Nate with applying r thresholding in his data
+  # dens <- lapply(allg_bystrength, function(rlist) {
+  #   lapply(rlist, function(group) {
+  #     lapply(group, function(g) {
+  #       graph.density(g)
+  #     })
+  #   })
+  # })
+  # 
+  # mm <- reshape2::melt(dens)
+  # mm %>% group_by(L1) %>% summarize(mean(value))
+  
   nodal_bystrength <- bind_nodal_measures(nodal_measures_glist(allg_bystrength, ncores=1))
   degree_effects_bystrength <- group_lm(nodal_bystrength, analyze_nodes = towhack) %>% 
     flag_nodes(pos=poswhack, neg=negwhack)
@@ -134,6 +146,12 @@ for (s in 1:1) {
     flag_nodes(pos=poswhack, neg=negwhack)
   
   summweighted <- weighted_analysis %>% group_by(nodeType) %>% summarize(pval=mean(p.value), tval=mean(statistic)) %>% mutate(method="weighted")
+  
+  #weighted with mean FC as covariate
+  #weighted_analysis_withmeanfc <- group_lm(nodal_weighted, analyze_nodes = towhack, f=formula(strength ~ group)) %>%
+  #  flag_nodes(pos=poswhack, neg=negwhack)
+  
+  #summweighted_withmeanfc <- weighted_analysis_withmeanfc %>% group_by(nodeType) %>% summarize(pval=mean(p.value), tval=mean(statistic)) %>% mutate(method="weighted")
   
   repsummaries <- bind_rows(summdens, summstrength, summstrength_dcov, summweighted)
   repsummaries$replication <- s
